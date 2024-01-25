@@ -1,29 +1,14 @@
 {
-  
-  "headers": [
+  "builds": [
       {
-        "source": "/(.*)",
-        "headers": [
-          { "key": "Access-Control-Allow-Origin", "value": "*" }
-        ]
-      },
-      {
-        "source": "/vercel_app_domain_name/(.*)",
-        "headers": [
-          { "key": "Access-Control-Allow-Origin", "value": "*" }
-        ]
-      }  
+          "src": "./index.js",
+          "use": "@vercel/node"
+      }
   ],
-    "builds": [
-        {
-            "src": "./index.js",
-            "use": "@vercel/node"
-        }
-    ],
-    "routes":[
-        {
-            "src":"/api/precios",
-            "dest": "/"
-        }
-    ]
+  "routes":[
+      {
+          "src":"/api/precios",
+          "dest": "/"
+      }
+  ]
 }
