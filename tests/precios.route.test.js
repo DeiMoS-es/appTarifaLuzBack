@@ -1,0 +1,216 @@
+const assert = require("node:assert/strict");
+const http = require("node:http");
+const { describe, it } = require("node:test");
+const axios = require("axios");
+const express = require("express");
+const { expectedHourlyIntervals } = require("../services/electricity-day");
+const { createRouter, isProviderNotPublishedError } = require("../routes/api/precios");
+
+const API_TEMPLATE = "https://provider.test/prices?start_date=old&end_date=old";
+
+function providerPayload(date, transform = values => values) {
+    const values = expectedHourlyIntervals(date).map((interval, index) => ({
+        datetime: interval.startsAt,
+        value: index + 1
+    }));
+    return {
+        data: {
+            data: { type: "PVPC" },
+            included: [{ type: "EUR/MWh", attributes: { values: transform(values) } }]
+        }
+    };
+}
+
+async function request(path, { provider, clock = () => "2024-01-15T12:00:00+01:00" } = {}) {
+    const app = express();
+    app.use("/api/precios", createRouter({ provider, clock, apiUri: () => API_TEMPLATE }));
+    const server = http.createServer(app);
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+        const address = server.address();
+        return await new Promise((resolve, reject) => {
+            http.get({ hostname: "127.0.0.1", port: address.port, path }, response => {
+                let body = "";
+                response.setEncoding("utf8");
+                response.on("data", chunk => { body += chunk; });
+                response.on("end", () => resolve({ status: response.statusCode, body: JSON.parse(body) }));
+            }).on("error", reject);
+        });
+    } finally {
+        await new Promise(resolve => server.close(resolve));
+    }
+}
+
+describe("GET /api/precios day contract", () => {
+    it("retrieves today and tomorrow as separate complete Madrid ranges", async () => {
+        const calls = [];
+        const provider = async call => {
+            calls.push(call);
+            return providerPayload(call.resolvedDate);
+        };
+
+        const today = await request("/api/precios?day=today", { provider });
+        const tomorrow = await request("/api/precios?day=tomorrow", { provider });
+
+        assert.equal(today.status, 200);
+        assert.equal(today.body.state, "available");
+        assert.equal(today.body.resolvedDate, "2024-01-15");
+        assert.equal(tomorrow.status, 200);
+        assert.equal(tomorrow.body.state, "available");
+        assert.equal(tomorrow.body.resolvedDate, "2024-01-16");
+        assert.deepEqual(calls.map(call => {
+            const url = new URL(call.url);
+            return [url.searchParams.get("start_date"), url.searchParams.get("end_date")];
+        }), [
+            ["2024-01-15T00:00:00+01:00", "2024-01-16T00:00:00+01:00"],
+            ["2024-01-16T00:00:00+01:00", "2024-01-17T00:00:00+01:00"]
+        ]);
+    });
+
+    it("returns 400 for unsupported, malformed, or missing selectors outside legacy mode", async () => {
+        const provider = async () => { throw new Error("provider must not be called"); };
+        for (const path of [
+            "/api/precios?day=yesterday",
+            "/api/precios?day=today&day=tomorrow",
+            "/api/precios?zone=peninsular"
+        ]) {
+            const response = await request(path, { provider });
+            assert.equal(response.status, 400);
+            assert.equal(response.body.error.code, "invalid_day");
+        }
+    });
+
+    it("maps available, unavailable, incomplete, and empty domain states to 200", async () => {
+        const cases = [
+            {
+                expected: "available",
+                path: "/api/precios?day=today",
+                provider: call => providerPayload(call.resolvedDate)
+            },
+            {
+                expected: "unavailable",
+                path: "/api/precios?day=tomorrow",
+                provider: async () => ({ data: { included: [] } })
+            },
+            {
+                expected: "incomplete",
+                path: "/api/precios?day=today",
+                provider: call => providerPayload(call.resolvedDate, values => values.slice(1))
+            },
+            {
+                expected: "empty",
+                path: "/api/precios?day=today",
+                provider: async () => ({ data: { included: [] } })
+            }
+        ];
+
+        for (const testCase of cases) {
+            const response = await request(testCase.path, { provider: testCase.provider });
+            assert.equal(response.status, 200);
+            assert.equal(response.body.state, testCase.expected);
+        }
+    });
+
+    it("preserves publication precedence and provider-delay semantics", async () => {
+        const emptyProvider = async () => ({ data: { included: [] } });
+        const before = await request("/api/precios?day=tomorrow", {
+            provider: emptyProvider,
+            clock: () => "2024-01-15T20:14:59+01:00"
+        });
+        const delayed = await request("/api/precios?day=tomorrow", {
+            provider: async () => ({ data: { included: [] }, notPublished: true }),
+            clock: () => "2024-01-15T20:15:00+01:00"
+        });
+
+        assert.equal(before.body.reason, "before_publication");
+        assert.equal(before.body.expectedPublicationAt, "2024-01-15T20:15:00+01:00");
+        assert.equal(delayed.status, 200);
+        assert.equal(delayed.body.state, "unavailable");
+        assert.equal(delayed.body.reason, "provider_delay");
+    });
+
+    it("recognizes only the documented provider not-published error", () => {
+        const documentedSignal = {
+            response: {
+                status: 502,
+                data: { errors: [{ detail: "Los datos solicitados no están disponibles en este momento" }] }
+            }
+        };
+
+        assert.equal(isProviderNotPublishedError(documentedSignal), true);
+        assert.equal(isProviderNotPublishedError({ response: { status: 502, data: { errors: [{ detail: "Bad gateway" }] } } }), false);
+        assert.equal(isProviderNotPublishedError({ response: { status: 404, data: documentedSignal.response.data } }), false);
+    });
+
+    it("maps the production adapter signal to provider delay and unrelated 404s to 502", async () => {
+        const originalGet = axios.get;
+        try {
+            axios.get = async () => {
+                const error = new Error("not published");
+                error.response = {
+                    status: 502,
+                    data: { errors: [{ detail: "Los datos solicitados no están disponibles en este momento" }] }
+                };
+                throw error;
+            };
+            const delayed = await request("/api/precios?day=tomorrow", {
+                clock: () => "2024-01-15T20:15:00+01:00"
+            });
+
+            assert.equal(delayed.status, 200);
+            assert.equal(delayed.body.state, "unavailable");
+            assert.equal(delayed.body.reason, "provider_delay");
+
+            axios.get = async () => {
+                const error = new Error("wrong endpoint");
+                error.response = { status: 404, data: { secret: "must-not-leak" } };
+                throw error;
+            };
+            const unrelated = await request("/api/precios?day=tomorrow", {
+                clock: () => "2024-01-15T20:15:00+01:00"
+            });
+
+            assert.equal(unrelated.status, 502);
+            assert.equal(unrelated.body.state, "failure");
+            assert.equal(unrelated.body.error.code, "provider");
+            assert.equal(JSON.stringify(unrelated.body).includes("must-not-leak"), false);
+        } finally {
+            axios.get = originalGet;
+        }
+    });
+
+    it("returns typed 502 failures without exposing provider error details", async () => {
+        const secret = "https://provider.test/?token=secret";
+        const timeout = new Error(secret);
+        timeout.code = "ETIMEDOUT";
+        const timedOut = await request("/api/precios?day=today", {
+            provider: async () => { throw timeout; }
+        });
+        const malformed = await request("/api/precios?day=today", {
+            provider: async () => ({ data: { unexpected: true } })
+        });
+
+        assert.equal(timedOut.status, 502);
+        assert.equal(timedOut.body.state, "failure");
+        assert.equal(timedOut.body.error.code, "timeout");
+        assert.equal(JSON.stringify(timedOut.body).includes("secret"), false);
+        assert.equal(malformed.status, 502);
+        assert.equal(malformed.body.error.code, "malformed_payload");
+    });
+
+    it("retains the no-query legacy response during migration", async () => {
+        const response = await request("/api/precios", {
+            provider: async call => {
+                assert.equal(call.legacy, true);
+                return providerPayload("2024-01-15", values => values.slice(0, 2));
+            }
+        });
+
+        assert.equal(response.status, 200);
+        assert.equal(response.body.precioZona, "PVPC");
+        assert.deepEqual(response.body.moneda, ["EUR/MWh"]);
+        assert.equal(response.body.preciosHoras.length, 2);
+        assert.deepEqual(Object.keys(response.body.preciosHoras[0]).sort(), ["datetime", "precio"]);
+    });
+});
