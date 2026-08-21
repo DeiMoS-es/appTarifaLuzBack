@@ -1,21 +1,124 @@
 // Encargado de gestionar las peticiones para obtener los precios de las distintas CCAA
-const router = require("express").Router();
+const express = require("express");
 const precioModel = require("../../models/electricidad.precios");
+const { normalizeProviderValues } = precioModel;
+const {
+    classifyElectricityDay,
+    createFailureResult,
+    resolveElectricityDay
+} = require("../../services/electricity-day");
 const axios = require("axios");
 const moment = require("moment");
 
-router.get('/', async (req, res) => {// Petición sobre la ruta /api/precios
-    try{
-        const currentDate = moment().format('YYYY-MM-DD');
-        const nextDayDate = moment().add(1, 'day').format('YYYY-MM-DD');
-        const apiUri = process.env.APIREDTADAURI.replace(/start_date=[^&]*/, `start_date=${currentDate}`).replace(/end_date=[^&]*/, `end_date=${nextDayDate}`);
-        const response = await axios.get(apiUri);
-        const precioData = new precioModel(response.data);
-        res.json(precioData);
-    }catch(err){
-        res.json({error: err.message});
+class MalformedProviderPayloadError extends Error {}
+
+const NOT_PUBLISHED_DETAIL = "Los datos solicitados no están disponibles en este momento";
+
+function isProviderNotPublishedError(error) {
+    const providerErrors = error?.response?.data?.errors;
+    return error?.response?.status === 502
+        && Array.isArray(providerErrors)
+        && providerErrors.some(providerError => providerError?.detail === NOT_PUBLISHED_DETAIL);
+}
+
+function buildProviderUrl(template, day) {
+    const url = new URL(template);
+    url.searchParams.set("start_date", day.startsAt);
+    url.searchParams.set("end_date", day.endsAt);
+    return url.toString();
+}
+
+async function defaultProvider(request) {
+    try {
+        return await axios.get(request.url);
+    } catch (error) {
+        if (!request.legacy && request.selector === "tomorrow" && isProviderNotPublishedError(error)) {
+            return { data: { included: [] }, notPublished: true };
+        }
+        throw error;
     }
-});
+}
+
+function providerValues(response) {
+    const included = response?.data?.included;
+    if (!Array.isArray(included)) throw new MalformedProviderPayloadError();
+
+    const items = [];
+    for (const group of included) {
+        if (!Array.isArray(group?.attributes?.values)) throw new MalformedProviderPayloadError();
+        items.push(...group.attributes.values);
+    }
+    return items;
+}
+
+function publicFailure(error) {
+    if (error instanceof MalformedProviderPayloadError) {
+        return { retryable: false, error: { code: "malformed_payload", message: "Electricity price provider returned an invalid payload" } };
+    }
+    if (error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT") {
+        return { retryable: true, error: { code: "timeout", message: "Electricity price provider timed out" } };
+    }
+    if (error?.response) {
+        return {
+            retryable: error.response.status >= 500,
+            error: { code: "provider", message: "Electricity price provider rejected the request" }
+        };
+    }
+    return { retryable: true, error: { code: "transport", message: "Electricity price provider is unavailable" } };
+}
+
+function createRouter({
+    provider = defaultProvider,
+    clock = () => new Date(),
+    apiUri = () => process.env.APIREDTADAURI
+} = {}) {
+    const router = express.Router();
+
+    router.get('/', async (req, res) => {// Petición sobre la ruta /api/precios
+        if (Object.keys(req.query).length === 0) {
+            try {
+                const currentDate = moment().format('YYYY-MM-DD');
+                const nextDayDate = moment().add(1, 'day').format('YYYY-MM-DD');
+                const legacyUrl = apiUri().replace(/start_date=[^&]*/, `start_date=${currentDate}`).replace(/end_date=[^&]*/, `end_date=${nextDayDate}`);
+                const response = await provider({ url: legacyUrl, legacy: true });
+                return res.json(new precioModel(response.data));
+            } catch (err) {
+                return res.json({error: err.message});
+            }
+        }
+
+        const now = clock();
+        let day;
+        try {
+            day = resolveElectricityDay(req.query.day, now);
+        } catch (error) {
+            return res.status(400).json({
+                error: { code: "invalid_day", message: "day must be today or tomorrow" }
+            });
+        }
+
+        try {
+            const url = buildProviderUrl(apiUri(), day);
+            const response = await provider({ url, ...day, legacy: false });
+            const normalized = normalizeProviderValues(providerValues(response));
+            const result = classifyElectricityDay({
+                ...day,
+                ...normalized,
+                notPublished: response.notPublished === true,
+                now
+            });
+            return res.status(200).json(result);
+        } catch (error) {
+            const failure = createFailureResult({ ...day, ...publicFailure(error) });
+            return res.status(502).json(failure);
+        }
+    });
+
+    return router;
+}
+
+const router = createRouter();
+
 /*
 router.get("/", async (req, res) => {
   // Petición sobre la ruta /api/precios
@@ -83,3 +186,6 @@ router.get("/:zone", async (req, res) => {
 
 
 module.exports = router;
+module.exports.createRouter = createRouter;
+module.exports.buildProviderUrl = buildProviderUrl;
+module.exports.isProviderNotPublishedError = isProviderNotPublishedError;
