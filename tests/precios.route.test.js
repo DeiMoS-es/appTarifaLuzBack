@@ -7,6 +7,12 @@ const { expectedHourlyIntervals } = require("../services/electricity-day");
 const { createRouter, isProviderNotPublishedError } = require("../routes/api/precios");
 
 const API_TEMPLATE = "https://provider.test/prices?start_date=old&end_date=old";
+const SHORT_NOT_PUBLISHED_DETAIL = "Los datos solicitados no están disponibles en este momento";
+const CURRENT_NOT_PUBLISHED_DETAIL = `${SHORT_NOT_PUBLISHED_DETAIL}. Inténtelo de nuevo más tarde.`;
+
+function providerError(status, detail) {
+    return { response: { status, data: { errors: [{ detail }] } } };
+}
 
 function providerPayload(date, transform = values => values) {
     const values = expectedHourlyIntervals(date).map((interval, index) => ({
@@ -130,51 +136,63 @@ describe("GET /api/precios day contract", () => {
         assert.equal(delayed.body.reason, "provider_delay");
     });
 
-    it("recognizes only the documented provider not-published error", () => {
-        const documentedSignal = {
-            response: {
-                status: 502,
-                data: { errors: [{ detail: "Los datos solicitados no están disponibles en este momento" }] }
-            }
-        };
+    it("recognizes only anchored 502 provider not-published details", () => {
+        assert.equal(isProviderNotPublishedError(providerError(502, SHORT_NOT_PUBLISHED_DETAIL)), true);
+        assert.equal(isProviderNotPublishedError(providerError(502, CURRENT_NOT_PUBLISHED_DETAIL)), true);
+        assert.equal(isProviderNotPublishedError(providerError(502, `  ${CURRENT_NOT_PUBLISHED_DETAIL}\n`)), true);
+        assert.equal(isProviderNotPublishedError(providerError(404, CURRENT_NOT_PUBLISHED_DETAIL)), false);
+        assert.equal(isProviderNotPublishedError(providerError(502, "Bad gateway")), false);
+        assert.deepEqual([
+            `${SHORT_NOT_PUBLISHED_DETAIL}.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL} Inténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}.\nInténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}.  Inténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}. Unknown suffix`
+        ].map(detail => isProviderNotPublishedError(providerError(502, detail))), [
+            false,
+            false,
+            false,
+            false,
+            false
+        ]);
 
-        assert.equal(isProviderNotPublishedError(documentedSignal), true);
-        assert.equal(isProviderNotPublishedError({ response: { status: 502, data: { errors: [{ detail: "Bad gateway" }] } } }), false);
-        assert.equal(isProviderNotPublishedError({ response: { status: 404, data: documentedSignal.response.data } }), false);
+        for (const malformed of [
+            { response: { status: 502, data: {} } },
+            { response: { status: 502, data: { errors: {} } } },
+            providerError(502, null)
+        ]) {
+            assert.equal(isProviderNotPublishedError(malformed), false);
+        }
     });
 
-    it("maps the production adapter signal to provider delay and unrelated 404s to 502", async () => {
+    it("maps the current production signal by publication time and selector", async () => {
         const originalGet = axios.get;
         try {
             axios.get = async () => {
                 const error = new Error("not published");
-                error.response = {
-                    status: 502,
-                    data: { errors: [{ detail: "Los datos solicitados no están disponibles en este momento" }] }
-                };
+                Object.assign(error, providerError(502, CURRENT_NOT_PUBLISHED_DETAIL));
                 throw error;
             };
+
+            const beforePublication = await request("/api/precios?day=tomorrow", {
+                clock: () => "2024-01-15T20:14:59+01:00"
+            });
             const delayed = await request("/api/precios?day=tomorrow", {
                 clock: () => "2024-01-15T20:15:00+01:00"
             });
-
-            assert.equal(delayed.status, 200);
-            assert.equal(delayed.body.state, "unavailable");
-            assert.equal(delayed.body.reason, "provider_delay");
-
-            axios.get = async () => {
-                const error = new Error("wrong endpoint");
-                error.response = { status: 404, data: { secret: "must-not-leak" } };
-                throw error;
-            };
-            const unrelated = await request("/api/precios?day=tomorrow", {
+            const today = await request("/api/precios?day=today", {
                 clock: () => "2024-01-15T20:15:00+01:00"
             });
 
-            assert.equal(unrelated.status, 502);
-            assert.equal(unrelated.body.state, "failure");
-            assert.equal(unrelated.body.error.code, "provider");
-            assert.equal(JSON.stringify(unrelated.body).includes("must-not-leak"), false);
+            assert.equal(beforePublication.status, 200);
+            assert.equal(beforePublication.body.state, "unavailable");
+            assert.equal(beforePublication.body.reason, "before_publication");
+            assert.equal(delayed.status, 200);
+            assert.equal(delayed.body.state, "unavailable");
+            assert.equal(delayed.body.reason, "provider_delay");
+            assert.equal(today.status, 502);
+            assert.equal(today.body.state, "failure");
+            assert.equal(today.body.error.code, "provider");
         } finally {
             axios.get = originalGet;
         }
