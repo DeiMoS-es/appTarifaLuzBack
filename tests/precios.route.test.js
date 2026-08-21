@@ -142,7 +142,19 @@ describe("GET /api/precios day contract", () => {
         assert.equal(isProviderNotPublishedError(providerError(502, `  ${CURRENT_NOT_PUBLISHED_DETAIL}\n`)), true);
         assert.equal(isProviderNotPublishedError(providerError(404, CURRENT_NOT_PUBLISHED_DETAIL)), false);
         assert.equal(isProviderNotPublishedError(providerError(502, "Bad gateway")), false);
-        assert.equal(isProviderNotPublishedError(providerError(502, `${SHORT_NOT_PUBLISHED_DETAIL}. Unknown suffix`)), false);
+        assert.deepEqual([
+            `${SHORT_NOT_PUBLISHED_DETAIL}.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL} Inténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}.\nInténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}.  Inténtelo de nuevo más tarde.`,
+            `${SHORT_NOT_PUBLISHED_DETAIL}. Unknown suffix`
+        ].map(detail => isProviderNotPublishedError(providerError(502, detail))), [
+            false,
+            false,
+            false,
+            false,
+            false
+        ]);
 
         for (const malformed of [
             { response: { status: 502, data: {} } },

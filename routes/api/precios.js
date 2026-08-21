@@ -12,14 +12,17 @@ const moment = require("moment");
 
 class MalformedProviderPayloadError extends Error {}
 
-const NOT_PUBLISHED_DETAIL = /^Los datos solicitados no están disponibles en este momento\.?(?:\s+Inténtelo de nuevo más tarde\.)?$/;
+const NOT_PUBLISHED_DETAILS = new Set([
+    "Los datos solicitados no están disponibles en este momento",
+    "Los datos solicitados no están disponibles en este momento. Inténtelo de nuevo más tarde."
+]);
 
 function isProviderNotPublishedError(error) {
     const providerErrors = error?.response?.data?.errors;
     return error?.response?.status === 502
         && Array.isArray(providerErrors)
         && providerErrors.some(providerError => typeof providerError?.detail === "string"
-            && NOT_PUBLISHED_DETAIL.test(providerError.detail.trim()));
+            && NOT_PUBLISHED_DETAILS.has(providerError.detail.trim()));
 }
 
 function buildProviderUrl(template, day) {
