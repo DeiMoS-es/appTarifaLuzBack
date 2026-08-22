@@ -1,14 +1,12 @@
 // Encargado de gestionar las peticiones para obtener los precios de las distintas CCAA
 const express = require("express");
-const precioModel = require("../../models/electricidad.precios");
-const { normalizeProviderValues } = precioModel;
+const { normalizeProviderValues } = require("../../models/electricidad.precios");
 const {
     classifyElectricityDay,
     createFailureResult,
     resolveElectricityDay
 } = require("../../services/electricity-day");
 const axios = require("axios");
-const moment = require("moment");
 
 class MalformedProviderPayloadError extends Error {}
 
@@ -36,7 +34,7 @@ async function defaultProvider(request) {
     try {
         return await axios.get(request.url);
     } catch (error) {
-        if (!request.legacy && request.selector === "tomorrow" && isProviderNotPublishedError(error)) {
+        if (request.selector === "tomorrow" && isProviderNotPublishedError(error)) {
             return { data: { included: [] }, notPublished: true };
         }
         throw error;
@@ -79,18 +77,6 @@ function createRouter({
     const router = express.Router();
 
     router.get('/', async (req, res) => {// Petición sobre la ruta /api/precios
-        if (Object.keys(req.query).length === 0) {
-            try {
-                const currentDate = moment().format('YYYY-MM-DD');
-                const nextDayDate = moment().add(1, 'day').format('YYYY-MM-DD');
-                const legacyUrl = apiUri().replace(/start_date=[^&]*/, `start_date=${currentDate}`).replace(/end_date=[^&]*/, `end_date=${nextDayDate}`);
-                const response = await provider({ url: legacyUrl, legacy: true });
-                return res.json(new precioModel(response.data));
-            } catch (err) {
-                return res.json({error: err.message});
-            }
-        }
-
         const now = clock();
         let day;
         try {
@@ -103,7 +89,7 @@ function createRouter({
 
         try {
             const url = buildProviderUrl(apiUri(), day);
-            const response = await provider({ url, ...day, legacy: false });
+            const response = await provider({ url, ...day });
             const normalized = normalizeProviderValues(providerValues(response));
             const result = classifyElectricityDay({
                 ...day,

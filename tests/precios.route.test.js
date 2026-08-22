@@ -74,7 +74,7 @@ describe("GET /api/precios day contract", () => {
         ]);
     });
 
-    it("returns 400 for unsupported, malformed, or missing selectors outside legacy mode", async () => {
+    it("returns 400 for unsupported, malformed, or unrelated selectors", async () => {
         const provider = async () => { throw new Error("provider must not be called"); };
         for (const path of [
             "/api/precios?day=yesterday",
@@ -217,18 +217,14 @@ describe("GET /api/precios day contract", () => {
         assert.equal(malformed.body.error.code, "malformed_payload");
     });
 
-    it("retains the no-query legacy response during migration", async () => {
+    it("requires the day selector when no query is provided", async () => {
         const response = await request("/api/precios", {
-            provider: async call => {
-                assert.equal(call.legacy, true);
-                return providerPayload("2024-01-15", values => values.slice(0, 2));
-            }
+            provider: async () => { throw new Error("provider must not be called"); }
         });
 
-        assert.equal(response.status, 200);
-        assert.equal(response.body.precioZona, "PVPC");
-        assert.deepEqual(response.body.moneda, ["EUR/MWh"]);
-        assert.equal(response.body.preciosHoras.length, 2);
-        assert.deepEqual(Object.keys(response.body.preciosHoras[0]).sort(), ["datetime", "precio"]);
+        assert.equal(response.status, 400);
+        assert.deepEqual(response.body, {
+            error: { code: "invalid_day", message: "day must be today or tomorrow" }
+        });
     });
 });
