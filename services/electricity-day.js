@@ -37,6 +37,34 @@ function expectedHourlyInstants(resolvedDate) {
     return expectedHourlyIntervals(resolvedDate).map(interval => interval.instant);
 }
 
+function selectElectricityDayValues(resolvedDate, normalized) {
+    const expectedInstants = new Set(expectedHourlyInstants(resolvedDate));
+    const start = dayStart(resolvedDate).toUTC().toMillis();
+    const end = dayStart(resolvedDate).plus({ days: 1 }).toUTC().toMillis();
+    let noncanonicalIntervalCount = 0;
+    const values = normalized.values.filter(value => {
+        if (expectedInstants.has(value.instant)) return true;
+        const instant = DateTime.fromISO(value.instant, { setZone: true });
+        if (instant.isValid && instant.toMillis() >= start && instant.toMillis() < end) {
+            noncanonicalIntervalCount += 1;
+        }
+        return false;
+    });
+    const invalidIntervalCount = noncanonicalIntervalCount + (Array.isArray(normalized.invalidIntervals)
+        ? normalized.invalidIntervals.filter(interval => {
+            if (!interval?.instant) return true;
+            const instant = DateTime.fromISO(interval.instant, { setZone: true });
+            return !instant.isValid || (instant.toMillis() >= start && instant.toMillis() < end);
+        }).length
+        : normalized.invalidIntervalCount);
+
+    return {
+        values,
+        receivedIntervalCount: values.length + invalidIntervalCount,
+        invalidIntervalCount
+    };
+}
+
 function resolveElectricityDay(selector, now) {
     if (!SELECTORS.has(selector)) throw new RangeError("day must be today or tomorrow");
     const madridNow = asMadridDateTime(now);
@@ -133,6 +161,7 @@ module.exports = {
     resolveElectricityDay,
     expectedHourlyIntervals,
     expectedHourlyInstants,
+    selectElectricityDayValues,
     classifyElectricityDay,
     createFailureResult
 };
