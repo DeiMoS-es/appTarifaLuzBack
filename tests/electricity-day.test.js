@@ -1,10 +1,12 @@
 const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
+const { DateTime } = require("luxon");
 const {
     classifyElectricityDay,
     createFailureResult,
     expectedHourlyIntervals,
-    resolveElectricityDay
+    resolveElectricityDay,
+    selectElectricityDayValues
 } = require("../services/electricity-day");
 const { normalizeProviderValues } = require("../models/electricidad.precios");
 
@@ -51,6 +53,80 @@ describe("Madrid electricity days", () => {
             value: index
         })));
         assert.deepEqual(normalized.values.map(value => value.instant), ["2024-10-27T00:00:00Z", "2024-10-27T01:00:00Z"]);
+    });
+
+    it("selects only canonical instants inside the Madrid calendar day", () => {
+        for (const date of ["2024-03-31", "2024-01-15", "2024-10-27"]) {
+            const expected = expectedHourlyIntervals(date);
+            const nextDate = DateTime.fromISO(date).plus({ days: 1 }).toISODate();
+            const nextMidnight = expectedHourlyIntervals(nextDate)[0];
+            const normalized = normalizeProviderValues([...expected, nextMidnight].map((interval, index) => ({
+                datetime: interval.startsAt,
+                value: index
+            })));
+            const selected = selectElectricityDayValues(date, normalized);
+
+            assert.equal(selected.values.length, expected.length);
+            assert.equal(selected.receivedIntervalCount, expected.length);
+            assert.equal(selected.invalidIntervalCount, 0);
+            assert.deepEqual(selected.values.map(value => value.instant), expected.map(value => value.instant));
+        }
+    });
+
+    it("attributes invalid intervals to their Madrid day and retains malformed timestamps", () => {
+        const date = "2024-01-15";
+        const expected = expectedHourlyIntervals(date);
+        const providerValues = expected.map((interval, index) => ({
+            datetime: interval.startsAt,
+            value: index
+        }));
+        const nextMidnight = expectedHourlyIntervals("2024-01-16")[0];
+        const outside = selectElectricityDayValues(date, normalizeProviderValues([
+            ...providerValues,
+            { datetime: nextMidnight.startsAt, value: "invalid" }
+        ]));
+        const inside = selectElectricityDayValues(date, normalizeProviderValues(
+            providerValues.map((value, index) => index === 0 ? { ...value, value: "invalid" } : value)
+        ));
+        const malformed = selectElectricityDayValues(date, normalizeProviderValues([
+            ...providerValues,
+            { datetime: "invalid", value: 1 }
+        ]));
+
+        assert.deepEqual(
+            [outside.values.length, outside.receivedIntervalCount, outside.invalidIntervalCount],
+            [24, 24, 0]
+        );
+        assert.deepEqual(
+            [inside.values.length, inside.receivedIntervalCount, inside.invalidIntervalCount],
+            [23, 24, 1]
+        );
+        assert.deepEqual(
+            [malformed.values.length, malformed.receivedIntervalCount, malformed.invalidIntervalCount],
+            [24, 25, 1]
+        );
+        assert.equal(classify(date, outside.values, outside).state, "available");
+        assert.equal(classify(date, inside.values, inside).state, "incomplete");
+        assert.equal(classify(date, malformed.values, malformed).state, "incomplete");
+    });
+
+    it("counts an attributable in-day noncanonical interval as invalid coverage", () => {
+        const date = "2024-01-15";
+        const providerValues = expectedHourlyIntervals(date).map((interval, index) => ({
+            datetime: interval.startsAt,
+            value: index
+        }));
+        const selected = selectElectricityDayValues(date, normalizeProviderValues([
+            ...providerValues,
+            { datetime: "2024-01-15T00:30:00+01:00", value: 99 }
+        ]));
+        const result = classify(date, selected.values, selected);
+
+        assert.equal(selected.values.length, 24);
+        assert.equal(selected.receivedIntervalCount, 25);
+        assert.equal(selected.invalidIntervalCount, 1);
+        assert.equal(result.state, "incomplete");
+        assert.equal(result.reason, "coverage_mismatch");
     });
 
     it("gives strict pre-publication precedence to successful empty tomorrow data", () => {
@@ -100,6 +176,9 @@ describe("Madrid electricity days", () => {
         for (const normalized of normalizedInvalidValues) {
             assert.equal(normalized.values.length, complete.length - 1);
             assert.equal(normalized.invalidIntervalCount, 1);
+            const selected = selectElectricityDayValues(date, normalized);
+            assert.equal(selected.receivedIntervalCount, complete.length);
+            assert.equal(selected.invalidIntervalCount, 1);
         }
         const cases = [
             classify(date, complete.slice(1)),

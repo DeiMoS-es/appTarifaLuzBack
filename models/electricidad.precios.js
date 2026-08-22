@@ -5,6 +5,7 @@ const NUMERIC_VALUE_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
 function normalizeProviderValues(items) {
     const normalized = [];
+    const invalidIntervals = [];
     let invalidIntervalCount = 0;
 
     for (const item of items) {
@@ -12,15 +13,16 @@ function normalizeProviderValues(items) {
         const numericValue = typeof value === "number"
             ? value
             : typeof value === "string" && NUMERIC_VALUE_PATTERN.test(value) ? Number(value) : NaN;
-        if (!item || typeof item.datetime !== "string"
-            || !Number.isFinite(numericValue)) {
+        const startsAt = item && typeof item.datetime === "string"
+            ? DateTime.fromISO(item.datetime, { setZone: true })
+            : null;
+        if (!startsAt?.isValid || !Number.isFinite(numericValue)) {
             invalidIntervalCount += 1;
-            continue;
-        }
-
-        const startsAt = DateTime.fromISO(item.datetime, { setZone: true });
-        if (!startsAt.isValid) {
-            invalidIntervalCount += 1;
+            invalidIntervals.push({
+                instant: startsAt?.isValid
+                    ? startsAt.toUTC().toISO({ suppressMilliseconds: true })
+                    : null
+            });
             continue;
         }
 
@@ -37,7 +39,8 @@ function normalizeProviderValues(items) {
     return {
         values: normalized,
         receivedIntervalCount: items.length,
-        invalidIntervalCount
+        invalidIntervalCount,
+        invalidIntervals
     };
 }
 

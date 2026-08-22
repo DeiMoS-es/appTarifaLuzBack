@@ -4,7 +4,8 @@ const { normalizeProviderValues } = require("../../models/electricidad.precios")
 const {
     classifyElectricityDay,
     createFailureResult,
-    resolveElectricityDay
+    resolveElectricityDay,
+    selectElectricityDayValues
 } = require("../../services/electricity-day");
 const axios = require("axios");
 
@@ -90,7 +91,10 @@ function createRouter({
         try {
             const url = buildProviderUrl(apiUri(), day);
             const response = await provider({ url, ...day });
-            const normalized = normalizeProviderValues(providerValues(response));
+            const normalized = selectElectricityDayValues(
+                day.resolvedDate,
+                normalizeProviderValues(providerValues(response))
+            );
             const result = classifyElectricityDay({
                 ...day,
                 ...normalized,

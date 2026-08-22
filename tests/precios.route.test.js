@@ -74,6 +74,45 @@ describe("GET /api/precios day contract", () => {
         ]);
     });
 
+    it("excludes an invalid inclusive next-midnight sample from today without stealing it from tomorrow", async () => {
+        const provider = call => providerPayload(call.resolvedDate, values => {
+            if (call.selector !== "today") return values;
+            const tomorrowMidnight = expectedHourlyIntervals("2024-01-16")[0];
+            return [...values, { datetime: tomorrowMidnight.startsAt, value: "invalid" }];
+        });
+
+        const today = await request("/api/precios?day=today", { provider });
+        const tomorrow = await request("/api/precios?day=tomorrow", { provider });
+        const todayInstants = new Set(today.body.values.map(value => value.instant));
+        const tomorrowInstants = new Set(tomorrow.body.values.map(value => value.instant));
+
+        assert.equal(today.body.state, "available");
+        assert.equal(today.body.expectedIntervalCount, 24);
+        assert.equal(today.body.receivedIntervalCount, 24);
+        assert.equal(today.body.values.length, 24);
+        assert.equal(today.body.values.at(-1).startsAt, "2024-01-15T23:00:00+01:00");
+        assert.equal(tomorrow.body.state, "available");
+        assert.equal(tomorrow.body.values[0].startsAt, "2024-01-16T00:00:00+01:00");
+        assert.equal([...todayInstants].some(instant => tomorrowInstants.has(instant)), false);
+    });
+
+    it("reports an in-day noncanonical interval as incomplete coverage", async () => {
+        const response = await request("/api/precios?day=today", {
+            provider: call => providerPayload(call.resolvedDate, values => [
+                ...values,
+                { datetime: "2024-01-15T00:30:00+01:00", value: 99 }
+            ])
+        });
+
+        assert.equal(response.status, 200);
+        assert.equal(response.body.state, "incomplete");
+        assert.equal(response.body.reason, "coverage_mismatch");
+        assert.equal(response.body.expectedIntervalCount, 24);
+        assert.equal(response.body.receivedIntervalCount, 25);
+        assert.equal(response.body.values.length, 24);
+        assert.equal(response.body.values.some(value => value.startsAt.includes("T00:30")), false);
+    });
+
     it("returns 400 for unsupported, malformed, or unrelated selectors", async () => {
         const provider = async () => { throw new Error("provider must not be called"); };
         for (const path of [
