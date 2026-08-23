@@ -13,9 +13,33 @@ const app = express();
 //   credentials: true, // Habilita el envío de cookies de manera segura entre el cliente y el servidor
 //   optionsSuccessStatus: 204, // Responde con un 204 (sin contenido) para las solicitudes OPTIONS
 //   }));
+const allowedOrigins = [
+  'http://localhost:4200',
+  'http://localhost:3000',
+  'http://localhost',
+  'https://app-tarifa-luz-front.vercel.app',
+  'https://app-tarifa-luz-front-git-main-deimoss-projects.vercel.app',
+];
+
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+
+      const isLocalHost = /^http:\/\/localhost(:\d+)?$/.test(origin);
+      const isVercelFrontend = /^https:\/\/.*\.vercel\.app$/.test(origin);
+      const isAllowed = allowedOrigins.includes(origin) || isLocalHost || isVercelFrontend;
+
+      if (isAllowed) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`CORS no permitido para: ${origin}`));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   })
 );
 app.use(express.json());
