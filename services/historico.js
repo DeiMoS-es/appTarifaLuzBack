@@ -112,6 +112,22 @@ async function ensureDaysCached(dates, zone = 'peninsular') {
   const missing = dates.filter(d => !(d in zoneCache));
   if (missing.length === 0) return cache;
 
+  // In serverless environments (e.g. Vercel) synchronous fetching of many days
+  // can easily hit function timeouts because we may perform many external
+  // HTTP requests. Avoid doing the full backfill synchronously there: return
+  // current cache state immediately and let an external cron/job or a
+  // subsequent background process fill missing days.
+  const runningServerless = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.SERVERLESS);
+  if (runningServerless) {
+    // Mark missing days as missing in cache so callers know they are absent
+    for (const day of missing) {
+      zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+    }
+    // Attempt to persist minimal marker, but don't fail if write isn't allowed
+    try { await writeCache(cache); } catch (e) {}
+    return cache;
+  }
+
   for (const day of missing) {
     try {
       const fetched = await fetchProviderForDay(day, zone);
