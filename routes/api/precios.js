@@ -24,10 +24,30 @@ function isProviderNotPublishedError(error) {
             && NOT_PUBLISHED_DETAILS.has(providerError.detail.trim()));
 }
 
-function buildProviderUrl(template, day) {
+const ZONE_CONFIG = {
+    peninsular: { geo_limit: "peninsular", geo_ids: "8741" },
+    canarias: { geo_limit: "canarias", geo_ids: "8742" },
+    baleares: { geo_limit: "baleares", geo_ids: "8743" },
+    ceuta: { geo_limit: "ceuta", geo_ids: "8744" },
+    melilla: { geo_limit: "melilla", geo_ids: "8745" }
+};
+
+function normalizeZone(zone) {
+    const normalized = typeof zone === "string" ? zone.trim().toLowerCase() : "peninsular";
+    const config = ZONE_CONFIG[normalized];
+    if (!config) {
+        throw new Error(`Unsupported zone: ${zone}`);
+    }
+    return config;
+}
+
+function buildProviderUrl(template, day, zone = "peninsular") {
     const url = new URL(template);
+    const config = normalizeZone(zone);
     url.searchParams.set("start_date", day.startsAt);
     url.searchParams.set("end_date", day.endsAt);
+    url.searchParams.set("geo_limit", config.geo_limit);
+    url.searchParams.set("geo_ids", config.geo_ids);
     return url.toString();
 }
 
@@ -88,9 +108,18 @@ function createRouter({
             });
         }
 
+        let zone = "peninsular";
         try {
-            const url = buildProviderUrl(apiUri(), day);
-            const response = await provider({ url, ...day });
+            zone = normalizeZone(req.query.zone);
+        } catch (error) {
+            return res.status(400).json({
+                error: { code: "invalid_zone", message: "zone must be one of peninsular, canarias, baleares, ceuta or melilla" }
+            });
+        }
+
+        try {
+            const url = buildProviderUrl(apiUri(), day, zone);
+            const response = await provider({ url, ...day, zone });
             const normalized = selectElectricityDayValues(
                 day.resolvedDate,
                 normalizeProviderValues(providerValues(response))
@@ -98,12 +127,13 @@ function createRouter({
             const result = classifyElectricityDay({
                 ...day,
                 ...normalized,
+                zone,
                 notPublished: response.notPublished === true,
                 now
             });
             return res.status(200).json(result);
         } catch (error) {
-            const failure = createFailureResult({ ...day, ...publicFailure(error) });
+            const failure = createFailureResult({ ...day, zone, ...publicFailure(error) });
             return res.status(502).json(failure);
         }
     });
@@ -182,4 +212,5 @@ router.get("/:zone", async (req, res) => {
 module.exports = router;
 module.exports.createRouter = createRouter;
 module.exports.buildProviderUrl = buildProviderUrl;
+module.exports.normalizeZone = normalizeZone;
 module.exports.isProviderNotPublishedError = isProviderNotPublishedError;

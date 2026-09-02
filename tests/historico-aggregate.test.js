@@ -1,4 +1,5 @@
 const { groupByDate, aggregateDay } = require('../services/historico');
+const { normalizeZone } = require('../routes/api/precios');
 const { DateTime } = require('luxon');
 
 // Minimal test for aggregation logic
@@ -25,4 +26,6 @@ if (!Array.isArray(grouped) || grouped.length !== 1) throw new Error('expected 1
 const agg = grouped[0];
 if (Math.abs(agg.media - (0+23)/2) > 1e-6) throw new Error('unexpected average');
 if (agg.minimo !== 0 || agg.maximo !== 23) throw new Error('unexpected min/max');
+const zone = normalizeZone('canarias');
+if (zone.geo_limit !== 'canarias' || zone.geo_ids !== '8742') throw new Error('unexpected canarias zone mapping');
 console.log('historico aggregation test passed');

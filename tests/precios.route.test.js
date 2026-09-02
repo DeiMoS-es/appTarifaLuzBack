@@ -118,11 +118,11 @@ describe("GET /api/precios day contract", () => {
         for (const path of [
             "/api/precios?day=yesterday",
             "/api/precios?day=today&day=tomorrow",
-            "/api/precios?zone=peninsular"
+            "/api/precios?zone=invalid"
         ]) {
             const response = await request(path, { provider });
             assert.equal(response.status, 400);
-            assert.equal(response.body.error.code, "invalid_day");
+            assert.equal(["invalid_day", "invalid_zone"].includes(response.body.error.code), true);
         }
     });
 

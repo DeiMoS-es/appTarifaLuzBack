@@ -1,11 +1,13 @@
 const fs = require('fs').promises;
 const path = require('path');
+const os = require('os');
 const axios = require('axios');
 const { DateTime } = require('luxon');
 const { normalizeProviderValues } = require('../models/electricidad.precios');
-const { buildProviderUrl } = require('../routes/api/precios');
+const { buildProviderUrl, normalizeZone } = require('../routes/api/precios');
 
-const CACHE_FILE = path.join(__dirname, '..', 'data', 'historico-cache.json');
+// Use a writable temp path when running in serverless environments (Vercel uses a read-only /var/task)
+const CACHE_FILE = process.env.HISTORICO_CACHE_FILE || (process.env.VERCEL ? path.join(os.tmpdir(), 'historico-cache.json') : path.join(__dirname, '..', 'data', 'historico-cache.json'));
 const API_TEMPLATE = () => process.env.APIREDTADAURI;
 const TIME_ZONE = 'Europe/Madrid';
 
@@ -18,9 +20,23 @@ async function readCache() {
   }
 }
 
+function getZoneCache(cache, zone) {
+  const normalized = normalizeZone(zone);
+  const zoneKey = normalized.geo_limit;
+  if (!cache[zoneKey]) cache[zoneKey] = {};
+  return cache[zoneKey];
+}
+
 async function writeCache(cache) {
-  await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
-  await fs.writeFile(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+  try {
+    await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+    await fs.writeFile(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+  } catch (err) {
+    // In serverless or read-only filesystems (e.g. Vercel), writes can fail.
+    // Don't let cache write failures break the API — fallback to in-memory behavior.
+    // Log the error for debugging but continue.
+    try { console.warn('historico cache write failed:', err && err.message ? err.message : err); } catch (e) {}
+  }
 }
 
 function aggregateDay(values) {
@@ -75,7 +91,7 @@ function groupByDate(normalizedValues) {
   return result;
 }
 
-async function fetchProviderForDay(dateIso) {
+async function fetchProviderForDay(dateIso, zone = 'peninsular') {
   // dateIso: YYYY-MM-DD
   const start = DateTime.fromISO(dateIso, { zone: TIME_ZONE }).startOf('day');
   const end = start.plus({ days: 1 });
@@ -83,25 +99,26 @@ async function fetchProviderForDay(dateIso) {
     startsAt: start.toISO({ suppressMilliseconds: true }),
     endsAt: end.toISO({ suppressMilliseconds: true })
   };
-  const url = buildProviderUrl(API_TEMPLATE(), day);
+  const url = buildProviderUrl(API_TEMPLATE(), day, zone);
   const response = await axios.get(url, { timeout: 30_000 });
   const items = response?.data?.included ? response.data.included.flatMap(g => g.attributes.values) : [];
   const normalized = normalizeProviderValues(items);
   return groupByDate(normalized.values)[0] || null; // should be single day
 }
 
-async function ensureDaysCached(dates) {
+async function ensureDaysCached(dates, zone = 'peninsular') {
   const cache = await readCache();
-  const missing = dates.filter(d => !(d in cache));
+  const zoneCache = getZoneCache(cache, zone);
+  const missing = dates.filter(d => !(d in zoneCache));
   if (missing.length === 0) return cache;
 
   for (const day of missing) {
     try {
-      const fetched = await fetchProviderForDay(day);
-      if (fetched) cache[day] = fetched;
-      else cache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+      const fetched = await fetchProviderForDay(day, zone);
+      if (fetched) zoneCache[day] = fetched;
+      else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
     } catch (err) {
-      cache[day] = { fecha: day, media: null, minimo: null, maximo: null, error: String(err.message || err) };
+      zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, error: String(err.message || err) };
     }
     // be polite with provider
     await new Promise(r => setTimeout(r, 300));
@@ -156,11 +173,12 @@ function aggregateWeeksFromDaily(dailyArray) {
   return weeks;
 }
 
-async function getHistorico(kind) {
+async function getHistorico(kind, zone = 'peninsular') {
   const dates = datesForRange(kind);
-  const cache = await ensureDaysCached(dates);
+  const cache = await ensureDaysCached(dates, zone);
+  const zoneCache = getZoneCache(cache, zone);
   const daily = dates.map(d => {
-    const fromCache = cache[d];
+    const fromCache = zoneCache[d];
     if (!fromCache) return { fecha: d, media: null, minimo: null, maximo: null };
     return {
       fecha: fromCache.fecha,
