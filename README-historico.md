@@ -29,3 +29,5 @@ Timezone:
 - Aggregation runs in Europe/Madrid (uses luxon) and groups hourly values by the local calendar date.
 
 If any change to the REE API template or querying logic is desired (e.g., switching time_trunc to day if supported), update process.env.APIREDTADAURI accordingly and the service will reuse it.
+
+<!-- redeploy trigger -->
