@@ -2,6 +2,8 @@ const express = require('express');
 const { normalizeZone } = require('./precios');
 const { getHistorico, ensureDaysCached } = require('../../services/historico');
 
+const axios = require('axios');
+const { buildProviderUrl } = require('./precios');
 const router = express.Router();
 
 function resolveZone(req) {
@@ -79,6 +81,34 @@ router.get('/week', async (req, res) => {
       return res.status(400).json({ error: 'invalid_zone', message: 'zone must be one of peninsular, canarias, baleares, ceuta or melilla' });
     }
     return res.status(500).json({ error: 'historico_error', message: String(err.message || err) });
+  }
+});
+
+// New helper route: proxy to provider to fetch full-year raw data (today minus 1 year -> today)
+// GET /api/historico/provider/anio
+router.get('/provider/anio', async (req, res) => {
+  try {
+    const zone = resolveZone(req);
+    const { DateTime } = require('luxon');
+    const tz = 'Europe/Madrid';
+    const now = DateTime.now().setZone(tz);
+    const start = now.minus({ years: 1 }).startOf('day');
+    const end = now.endOf('day');
+
+    const day = {
+      startsAt: start.toISO({ suppressMilliseconds: true }),
+      endsAt: end.toISO({ suppressMilliseconds: true })
+    };
+
+    const apiTemplate = process.env.APIREDTADAURI;
+    if (!apiTemplate) return res.status(500).json({ error: 'missing_api_template', message: 'APIREDTADAURI not configured in environment' });
+
+    const url = buildProviderUrl(apiTemplate, day, zone.geo_limit);
+    // Proxy the provider call and return raw provider payload so you can inspect hourly values for the full year
+    const response = await axios.get(url, { timeout: 120000 });
+    return res.status(200).json(response.data);
+  } catch (err) {
+    return res.status(502).json({ error: 'provider_error', message: String(err.message || err) });
   }
 });
 
