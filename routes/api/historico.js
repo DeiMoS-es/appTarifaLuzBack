@@ -39,12 +39,33 @@ router.get('/mes', async (req, res) => {
   }
 });
 
+// Helper to execute getHistorico with an internal timeout to avoid Vercel 504s
+async function getHistoricoWithTimeout(kind, zone, ms = 7000) {
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => resolve({ __timedOut: true }), ms);
+  });
+  try {
+    const result = await Promise.race([getHistorico(kind, zone), timeout]);
+    if (result && result.__timedOut) return { __timedOut: true };
+    return { values: result };
+  } catch (err) {
+    // propagate error
+    throw err;
+  }
+}
+
 // GET /api/historico/anio
 router.get('/anio', async (req, res) => {
   try {
     const zone = resolveZone(req);
-    const data = await getHistorico('anio', zone.geo_limit);
-    return res.status(200).json({ range: 'anio', zone: zone.geo_limit, values: data });
+    const resp = await getHistoricoWithTimeout('anio', zone.geo_limit, 7000);
+    if (resp.__timedOut) {
+      // return consistent shape with nulls for values if we timed out
+      const dates = require('../../services/historico').datesForRange('anio');
+      const values = dates.map(d => ({ fecha: d, media: null, minimo: null, maximo: null }));
+      return res.status(200).json({ range: 'anio', zone: zone.geo_limit, values, partial: true, message: 'Datos parciales: la recopilación se está procesando y se devolverán cuando esté disponible.' });
+    }
+    return res.status(200).json({ range: 'anio', zone: zone.geo_limit, values: resp.values });
   } catch (err) {
     if (err && typeof err.message === 'string' && err.message.startsWith('Unsupported zone:')) {
       return res.status(400).json({ error: 'invalid_zone', message: 'zone must be one of peninsular, canarias, baleares, ceuta or melilla' });
