@@ -144,16 +144,37 @@ async function ensureDaysCached(dates, zone = 'peninsular') {
       for (const d of fetchedDays) {
         if (d && d.fecha) zoneCache[d.fecha] = d;
       }
-      // mark any still-missing days explicitly as missing
-      for (const day of missing) {
-        if (!(day in zoneCache)) zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+
+      // If range fetch did not return all days, attempt per-day fetch for remaining dates
+      const stillMissing = missing.filter(day => !(day in zoneCache));
+      if (stillMissing.length > 0) {
+        for (const day of stillMissing) {
+          try {
+            const fetched = await fetchProviderForDay(day, zone);
+            if (fetched) zoneCache[day] = fetched;
+            else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+          } catch (e) {
+            // if per-day fetching fails, mark as missing but continue
+            zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true, error: String(e && e.message ? e.message : e) };
+          }
+          // be polite with provider when doing multiple calls
+          await new Promise(r => setTimeout(r, 250));
+        }
       }
+
       try { await writeCache(cache); } catch (e) {}
       return cache;
     } catch (err) {
-      // If range fetch fails, don't block: mark missing and return quickly
+      // If range fetch fails, don't block: attempt per-day fetch as a fallback
       for (const day of missing) {
-        zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+        try {
+          const fetched = await fetchProviderForDay(day, zone);
+          if (fetched) zoneCache[day] = fetched;
+          else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+        } catch (e) {
+          zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true, error: String(e && e.message ? e.message : e) };
+        }
+        await new Promise(r => setTimeout(r, 250));
       }
       try { await writeCache(cache); } catch (e) {}
       return cache;
