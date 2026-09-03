@@ -106,6 +106,22 @@ async function fetchProviderForDay(dateIso, zone = 'peninsular') {
   return groupByDate(normalized.values)[0] || null; // should be single day
 }
 
+// Fetch provider data for an inclusive date range (YYYY-MM-DD start to end)
+async function fetchProviderForRange(startIso, endIso, zone = 'peninsular') {
+  const start = DateTime.fromISO(startIso, { zone: TIME_ZONE }).startOf('day');
+  const end = DateTime.fromISO(endIso, { zone: TIME_ZONE }).endOf('day');
+  const day = {
+    startsAt: start.toISO({ suppressMilliseconds: true }),
+    endsAt: end.toISO({ suppressMilliseconds: true })
+  };
+  const url = buildProviderUrl(API_TEMPLATE(), day, zone);
+  const response = await axios.get(url, { timeout: 60_000 });
+  const items = response?.data?.included ? response.data.included.flatMap(g => g.attributes.values) : [];
+  const normalized = normalizeProviderValues(items);
+  // groupByDate returns sorted daily aggregates
+  return groupByDate(normalized.values);
+}
+
 async function ensureDaysCached(dates, zone = 'peninsular') {
   const cache = await readCache();
   const zoneCache = getZoneCache(cache, zone);
@@ -114,18 +130,34 @@ async function ensureDaysCached(dates, zone = 'peninsular') {
 
   // In serverless environments (e.g. Vercel) synchronous fetching of many days
   // can easily hit function timeouts because we may perform many external
-  // HTTP requests. Avoid doing the full backfill synchronously there: return
-  // current cache state immediately and let an external cron/job or a
-  // subsequent background process fill missing days.
+  // HTTP requests. Prefer a single range request to the provider when
+  // possible, falling back to marking days as missing if the provider call fails.
   const runningServerless = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.SERVERLESS);
   if (runningServerless) {
-    // Mark missing days as missing in cache so callers know they are absent
-    for (const day of missing) {
-      zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+    try {
+      // attempt to fetch as a single range from earliest missing to latest missing
+      const sortedMissing = missing.slice().sort();
+      const rangeStart = sortedMissing[0];
+      const rangeEnd = sortedMissing[sortedMissing.length - 1];
+      const fetchedDays = await fetchProviderForRange(rangeStart, rangeEnd, zone);
+      // populate cache with any fetched days
+      for (const d of fetchedDays) {
+        if (d && d.fecha) zoneCache[d.fecha] = d;
+      }
+      // mark any still-missing days explicitly as missing
+      for (const day of missing) {
+        if (!(day in zoneCache)) zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+      }
+      try { await writeCache(cache); } catch (e) {}
+      return cache;
+    } catch (err) {
+      // If range fetch fails, don't block: mark missing and return quickly
+      for (const day of missing) {
+        zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+      }
+      try { await writeCache(cache); } catch (e) {}
+      return cache;
     }
-    // Attempt to persist minimal marker, but don't fail if write isn't allowed
-    try { await writeCache(cache); } catch (e) {}
-    return cache;
   }
 
   for (const day of missing) {
