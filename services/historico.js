@@ -265,4 +265,4 @@ async function getHistorico(kind, zone = 'peninsular') {
   return daily;
 }
 
-module.exports = { getHistorico, ensureDaysCached, CACHE_FILE, aggregateDay, groupByDate };
+module.exports = { getHistorico, ensureDaysCached, CACHE_FILE, aggregateDay, groupByDate, datesForRange };
