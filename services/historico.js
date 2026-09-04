@@ -15,7 +15,6 @@ const PROVIDER_REQUEST_BUDGET_MS = Number(process.env.HISTORICO_PROVIDER_BUDGET_
 const PROVIDER_CALL_TIMEOUT_MS = Number(process.env.HISTORICO_PROVIDER_TIMEOUT_MS) || 1_200;
 const PROVIDER_MAX_CALLS = Number(process.env.HISTORICO_PROVIDER_MAX_CALLS) || 2;
 const PROVIDER_COOLDOWN_MS = Number(process.env.HISTORICO_PROVIDER_COOLDOWN_MS) || 5 * 60_000;
-const ANNUAL_REFRESH_DAYS = 2;
 let cacheMutationQueue = Promise.resolve();
 let cacheMutationsPending = 0;
 const retryCooldownMemory = new Map();
@@ -77,7 +76,7 @@ async function readCacheDetails(cacheFile = CACHE_FILE, seedFile = SEED_FILE) {
           cacheFile,
           code: err && err.code
         });
-        return { cache, fromSeed: recovery.source === 'seed', recoveredFrom: recovery.source };
+        return { cache, fromSeed: recovery.source === 'seed', recoveredFrom: recovery.source, recoveryCode: err && err.code };
       } catch (recoveryError) {
         if (recoveryError && recoveryError.code !== 'ENOENT') {
           structuredLog('warn', 'cache_recovery_source_invalid', { source: recovery.source, code: recoveryError.code });
@@ -402,7 +401,7 @@ async function getHistoricoResult(kind, zone = 'peninsular') {
 }
 
 async function getAnnualHistoricoResult(dates, zone) {
-  await refreshAnnualBoundary(dates, zone);
+  await refreshAnnualWindow(dates, zone);
   // Atomic rename guarantees this read sees either the previous or next complete snapshot.
   const { cache } = await readCacheDetails();
   migrateLegacyRoot(cache);
@@ -422,23 +421,26 @@ async function getAnnualHistoricoResult(dates, zone) {
   };
 }
 
-async function refreshAnnualBoundary(dates, zone) {
-  const boundaryDates = dates.slice(-ANNUAL_REFRESH_DAYS);
-  const { cache, recoveredFrom } = await readCacheDetails();
-  if (recoveredFrom) return;
+async function refreshAnnualWindow(dates, zone) {
+  const { cache, recoveredFrom, recoveryCode } = await readCacheDetails();
+  // A corrupt primary remains untouched during recovery reads. A later explicit
+  // write may quarantine it, but an annual read must not silently replace it.
+  if (recoveryCode === 'HISTORICO_CACHE_CORRUPT') return;
   migrateLegacyRoot(cache);
   const zoneCache = getZoneCache(cache, zone);
-  const missingBoundary = boundaryDates.filter(date => !isUsableDay(zoneCache[date]));
-  if (missingBoundary.length === 0) return;
+  const missingDates = dates.filter(date => !isUsableDay(zoneCache[date]));
+  if (missingDates.length === 0 && !recoveredFrom) return;
 
   // Never queue annual work behind an existing week/month backfill. Returning the
   // current partial snapshot is safer than turning an annual read into a long wait.
   if (cacheMutationsPending > 0) {
-    structuredLog('warn', 'annual_refresh_skipped_busy', { zone: normalizeZone(zone).geo_limit, missingDays: missingBoundary.length });
+    structuredLog('warn', 'annual_refresh_skipped_busy', { zone: normalizeZone(zone).geo_limit, missingDays: missingDates.length });
     return;
   }
 
-  await serializeCacheMutation(() => ensureDaysCachedSerialized(missingBoundary, zone));
+  // Passing the full window lets the bounded range fetch repair interior gaps.
+  // ensureDaysCachedSerialized still permits at most the configured two calls.
+  await serializeCacheMutation(() => ensureDaysCachedSerialized(dates, zone));
 }
 
 module.exports = {

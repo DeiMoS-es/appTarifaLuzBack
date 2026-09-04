@@ -112,6 +112,27 @@ describe('historico cache resilience', () => {
     assert.equal(digest(seed), beforeHash);
   });
 
+  it('materializes a stale seed into runtime and refreshes within the provider call cap', async () => {
+    const annualDates = dates('anio');
+    await fsp.writeFile(seedFile, JSON.stringify(cacheForDates(annualDates.slice(0, 3))), 'utf8');
+    const seedHash = digest(seedFile);
+    await fsp.rm(cacheFile, { force: true });
+    let providerCalls = 0;
+    axios.get = async () => {
+      providerCalls += 1;
+      return { data: { included: [] } };
+    };
+
+    const result = await historico.getHistoricoResult('anio', 'peninsular');
+
+    assert.equal(result.partial, true);
+    assert.equal(result.metadata.availableDays, 3);
+    assert.equal(providerCalls, 2);
+    assert.equal(fs.existsSync(cacheFile), true);
+    assert.equal(JSON.parse(await fsp.readFile(cacheFile, 'utf8')).peninsular[annualDates[0]].media, 1);
+    assert.equal(digest(seedFile), seedHash);
+  });
+
   it('returns a complete year as numeric weekly buckets instead of daily null placeholders', async () => {
     await saveCache(cacheForDates(dates('anio')));
 
@@ -128,6 +149,7 @@ describe('historico cache resilience', () => {
   it('keeps available numbers and reports missing days for a partial annual cache', async () => {
     const annualDates = dates('anio');
     await saveCache(cacheForDates([...annualDates.slice(0, 12), ...annualDates.slice(-2)]));
+    axios.get = async () => ({ data: { included: [] } });
 
     const result = await historico.getHistoricoResult('anio', 'peninsular');
 
@@ -139,7 +161,7 @@ describe('historico cache resilience', () => {
     assert.match(result.message, /partial/i);
   });
 
-  it('refreshes only the missing annual frontier and includes the fetched day', async () => {
+  it('refreshes a missing annual day and includes it in the window', async () => {
     const annualDates = dates('anio');
     const latestDate = annualDates.at(-1);
     await saveCache(cacheForDates(annualDates.slice(0, -1)));
@@ -158,20 +180,33 @@ describe('historico cache resilience', () => {
     assert.equal(JSON.parse(await fsp.readFile(cacheFile, 'utf8')).peninsular[latestDate].media, 42);
   });
 
-  it('does not attempt to fill historical gaps outside the annual frontier', async () => {
+  it('fills consecutive and interior annual gaps with one range call', async () => {
     const annualDates = dates('anio');
-    await saveCache(cacheForDates(annualDates.slice(-2)));
+    const missingDates = [annualDates[40], annualDates[41], annualDates[200]];
+    const cache = cacheForDates(annualDates);
+    for (const date of missingDates) delete cache.peninsular[date];
+    await saveCache(cache);
     let providerCalls = 0;
     axios.get = async () => {
       providerCalls += 1;
-      throw new Error('historical gaps must not be fetched');
+      return {
+        data: {
+          included: [{
+            attributes: {
+              values: missingDates.map((date, index) => ({ datetime: `${date}T12:00:00+02:00`, value: 50 + index }))
+            }
+          }]
+        }
+      };
     };
 
     const result = await historico.getHistoricoResult('anio', 'peninsular');
 
-    assert.equal(result.partial, true);
-    assert.equal(result.metadata.availableDays, 2);
-    assert.equal(providerCalls, 0);
+    assert.equal(result.partial, false);
+    assert.equal(result.metadata.availableDays, 365);
+    assert.equal(providerCalls, 1);
+    const persisted = JSON.parse(await fsp.readFile(cacheFile, 'utf8'));
+    assert.ok(missingDates.every(date => Number.isFinite(persisted.peninsular[date].media)));
   });
 
   it('returns a partial annual snapshot under budget and cooldown when the provider is down', async () => {
@@ -192,8 +227,9 @@ describe('historico cache resilience', () => {
 
     assert.equal(first.partial, true);
     assert.equal(second.partial, true);
-    assert.equal(callsAfterFirst, 1);
+    assert.equal(callsAfterFirst, 2);
     assert.equal(providerCalls, callsAfterFirst);
+    assert.ok(callsAfterFirst <= 2, 'annual fallback exceeded the provider call cap');
     assert.ok(Date.now() - startedAt < 500);
   });
 
