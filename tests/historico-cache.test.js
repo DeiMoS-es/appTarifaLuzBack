@@ -127,7 +127,7 @@ describe('historico cache resilience', () => {
 
   it('keeps available numbers and reports missing days for a partial annual cache', async () => {
     const annualDates = dates('anio');
-    await saveCache(cacheForDates(annualDates.slice(0, 14)));
+    await saveCache(cacheForDates([...annualDates.slice(0, 12), ...annualDates.slice(-2)]));
 
     const result = await historico.getHistoricoResult('anio', 'peninsular');
 
@@ -139,22 +139,62 @@ describe('historico cache resilience', () => {
     assert.match(result.message, /partial/i);
   });
 
-  it('does not call a slow provider or continue writing after an annual response', async () => {
+  it('refreshes only the missing annual frontier and includes the fetched day', async () => {
     const annualDates = dates('anio');
-    await saveCache(cacheForDates(annualDates.slice(0, 3)));
+    const latestDate = annualDates.at(-1);
+    await saveCache(cacheForDates(annualDates.slice(0, -1)));
+    let providerCalls = 0;
+    axios.get = async (url) => {
+      providerCalls += 1;
+      assert.match(url, new RegExp(latestDate));
+      return { data: { included: [{ attributes: { values: [{ datetime: `${latestDate}T12:00:00+02:00`, value: 42 }] } }] } };
+    };
+
+    const result = await historico.getHistoricoResult('anio', 'peninsular');
+
+    assert.equal(result.partial, false);
+    assert.equal(result.metadata.availableDays, 365);
+    assert.equal(providerCalls, 1);
+    assert.equal(JSON.parse(await fsp.readFile(cacheFile, 'utf8')).peninsular[latestDate].media, 42);
+  });
+
+  it('does not attempt to fill historical gaps outside the annual frontier', async () => {
+    const annualDates = dates('anio');
+    await saveCache(cacheForDates(annualDates.slice(-2)));
     let providerCalls = 0;
     axios.get = async () => {
       providerCalls += 1;
-      return new Promise(() => {});
+      throw new Error('historical gaps must not be fetched');
     };
-    const beforeHash = digest(cacheFile);
 
     const result = await historico.getHistoricoResult('anio', 'peninsular');
-    await new Promise(resolve => setTimeout(resolve, 50));
 
     assert.equal(result.partial, true);
+    assert.equal(result.metadata.availableDays, 2);
     assert.equal(providerCalls, 0);
-    assert.equal(digest(cacheFile), beforeHash);
+  });
+
+  it('returns a partial annual snapshot under budget and cooldown when the provider is down', async () => {
+    const annualDates = dates('anio');
+    await saveCache(cacheForDates(annualDates.slice(-1)));
+    let providerCalls = 0;
+    axios.get = (_url, options) => {
+      providerCalls += 1;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ERR_CANCELED' })), { once: true });
+      });
+    };
+    const startedAt = Date.now();
+
+    const first = await historico.getHistoricoResult('anio', 'peninsular');
+    const callsAfterFirst = providerCalls;
+    const second = await historico.getHistoricoResult('anio', 'peninsular');
+
+    assert.equal(first.partial, true);
+    assert.equal(second.partial, true);
+    assert.equal(callsAfterFirst, 1);
+    assert.equal(providerCalls, callsAfterFirst);
+    assert.ok(Date.now() - startedAt < 500);
   });
 
   it('serves the annual snapshot while a weekly provider backfill holds the mutation queue', async () => {

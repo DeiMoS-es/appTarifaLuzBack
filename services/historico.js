@@ -15,7 +15,9 @@ const PROVIDER_REQUEST_BUDGET_MS = Number(process.env.HISTORICO_PROVIDER_BUDGET_
 const PROVIDER_CALL_TIMEOUT_MS = Number(process.env.HISTORICO_PROVIDER_TIMEOUT_MS) || 1_200;
 const PROVIDER_MAX_CALLS = Number(process.env.HISTORICO_PROVIDER_MAX_CALLS) || 2;
 const PROVIDER_COOLDOWN_MS = Number(process.env.HISTORICO_PROVIDER_COOLDOWN_MS) || 5 * 60_000;
+const ANNUAL_REFRESH_DAYS = 2;
 let cacheMutationQueue = Promise.resolve();
+let cacheMutationsPending = 0;
 const retryCooldownMemory = new Map();
 
 function structuredLog(level, event, details = {}) {
@@ -141,9 +143,10 @@ async function writeCacheAtomic(cache, cacheFile = CACHE_FILE) {
 }
 
 function serializeCacheMutation(operation) {
+  cacheMutationsPending += 1;
   const pending = cacheMutationQueue.then(operation, operation);
   cacheMutationQueue = pending.catch(() => {});
-  return pending;
+  return pending.finally(() => { cacheMutationsPending -= 1; });
 }
 
 async function writeCache(cache) {
@@ -399,8 +402,8 @@ async function getHistoricoResult(kind, zone = 'peninsular') {
 }
 
 async function getAnnualHistoricoResult(dates, zone) {
+  await refreshAnnualBoundary(dates, zone);
   // Atomic rename guarantees this read sees either the previous or next complete snapshot.
-  // Keep annual reads outside the mutation queue so provider backfills cannot block them.
   const { cache } = await readCacheDetails();
   migrateLegacyRoot(cache);
   const zoneCache = getZoneCache(cache, zone);
@@ -417,6 +420,25 @@ async function getAnnualHistoricoResult(dates, zone) {
     message: missingDays > 0 ? 'Historical data is partial; only cached numeric days are included.' : undefined,
     metadata: { requestedDays: dates.length, availableDays: available.length, missingDays, bucketCount: values.length }
   };
+}
+
+async function refreshAnnualBoundary(dates, zone) {
+  const boundaryDates = dates.slice(-ANNUAL_REFRESH_DAYS);
+  const { cache, recoveredFrom } = await readCacheDetails();
+  if (recoveredFrom) return;
+  migrateLegacyRoot(cache);
+  const zoneCache = getZoneCache(cache, zone);
+  const missingBoundary = boundaryDates.filter(date => !isUsableDay(zoneCache[date]));
+  if (missingBoundary.length === 0) return;
+
+  // Never queue annual work behind an existing week/month backfill. Returning the
+  // current partial snapshot is safer than turning an annual read into a long wait.
+  if (cacheMutationsPending > 0) {
+    structuredLog('warn', 'annual_refresh_skipped_busy', { zone: normalizeZone(zone).geo_limit, missingDays: missingBoundary.length });
+    return;
+  }
+
+  await serializeCacheMutation(() => ensureDaysCachedSerialized(missingBoundary, zone));
 }
 
 module.exports = {
