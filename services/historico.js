@@ -10,32 +10,153 @@ const { buildProviderUrl, normalizeZone } = require('../routes/api/precios');
 const CACHE_FILE = process.env.HISTORICO_CACHE_FILE || (process.env.VERCEL ? path.join(os.tmpdir(), 'historico-cache.json') : path.join(__dirname, '..', 'data', 'historico-cache.json'));
 const API_TEMPLATE = () => process.env.APIREDTADAURI;
 const TIME_ZONE = 'Europe/Madrid';
+const SEED_FILE = process.env.HISTORICO_SEED_FILE || path.join(__dirname, '..', 'data', 'historico-cache.json');
+const PROVIDER_REQUEST_BUDGET_MS = Number(process.env.HISTORICO_PROVIDER_BUDGET_MS) || 2_500;
+const PROVIDER_CALL_TIMEOUT_MS = Number(process.env.HISTORICO_PROVIDER_TIMEOUT_MS) || 1_200;
+const PROVIDER_MAX_CALLS = Number(process.env.HISTORICO_PROVIDER_MAX_CALLS) || 2;
+const PROVIDER_COOLDOWN_MS = Number(process.env.HISTORICO_PROVIDER_COOLDOWN_MS) || 5 * 60_000;
+let cacheMutationQueue = Promise.resolve();
+const retryCooldownMemory = new Map();
+
+function structuredLog(level, event, details = {}) {
+  const record = JSON.stringify({ component: 'historico', event, ...details });
+  const output = console[level] || console.log;
+  output.call(console, record);
+}
+
+function isUsableDay(value) {
+  return Boolean(value && typeof value === 'object' && typeof value.media === 'number' && Number.isFinite(value.media));
+}
+
+function migrateLegacyRoot(cache) {
+  if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return false;
+  if (!cache.peninsular || typeof cache.peninsular !== 'object' || Array.isArray(cache.peninsular)) {
+    cache.peninsular = {};
+  }
+
+  let migrated = false;
+  for (const [key, value] of Object.entries(cache)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key) || !isUsableDay(value)) continue;
+    if (!isUsableDay(cache.peninsular[key])) {
+      cache.peninsular[key] = value;
+      migrated = true;
+    }
+  }
+  return migrated;
+}
+
+async function parseCacheFile(file) {
+  const raw = await fs.readFile(file, 'utf8');
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('cache root must be an object');
+    return parsed;
+  } catch (err) {
+    const error = new Error(`historico cache is corrupt: ${file}`);
+    error.code = 'HISTORICO_CACHE_CORRUPT';
+    error.cause = err;
+    throw error;
+  }
+}
+
+async function readCacheDetails(cacheFile = CACHE_FILE, seedFile = SEED_FILE) {
+  try {
+    return { cache: await parseCacheFile(cacheFile), fromSeed: false };
+  } catch (err) {
+    const recoveryFiles = [
+      { file: `${cacheFile}.bak`, source: 'backup' },
+      ...(cacheFile !== seedFile ? [{ file: seedFile, source: 'seed' }] : [])
+    ];
+    for (const recovery of recoveryFiles) {
+      try {
+        const cache = await parseCacheFile(recovery.file);
+        structuredLog(err && err.code === 'HISTORICO_CACHE_CORRUPT' ? 'error' : 'warn', 'cache_recovered', {
+          source: recovery.source,
+          cacheFile,
+          code: err && err.code
+        });
+        return { cache, fromSeed: recovery.source === 'seed', recoveredFrom: recovery.source };
+      } catch (recoveryError) {
+        if (recoveryError && recoveryError.code !== 'ENOENT') {
+          structuredLog('warn', 'cache_recovery_source_invalid', { source: recovery.source, code: recoveryError.code });
+        }
+      }
+    }
+    if (err && err.code === 'ENOENT') return { cache: {}, fromSeed: false };
+    structuredLog('error', 'cache_recovery_failed', { cacheFile, code: err && err.code });
+    throw err;
+  }
+}
 
 async function readCache() {
-  try {
-    const raw = await fs.readFile(CACHE_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (err) {
-    return {}; // empty cache
-  }
+  return (await readCacheDetails()).cache;
 }
 
 function getZoneCache(cache, zone) {
   const normalized = normalizeZone(zone);
   const zoneKey = normalized.geo_limit;
-  if (!cache[zoneKey]) cache[zoneKey] = {};
+  if (!cache[zoneKey] || typeof cache[zoneKey] !== 'object' || Array.isArray(cache[zoneKey])) cache[zoneKey] = {};
   return cache[zoneKey];
 }
 
-async function writeCache(cache) {
+async function writeCacheAtomic(cache, cacheFile = CACHE_FILE) {
+  const directory = path.dirname(cacheFile);
+  const temporary = path.join(directory, `.${path.basename(cacheFile)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  const backupFile = `${cacheFile}.bak`;
+  const backupTemporary = `${temporary}.bak`;
   try {
-    await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
-    await fs.writeFile(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(temporary, JSON.stringify(cache, null, 2), 'utf8');
+    let currentRaw;
+    try {
+      currentRaw = await fs.readFile(cacheFile, 'utf8');
+    } catch (currentError) {
+      if (!currentError || currentError.code !== 'ENOENT') throw currentError;
+    }
+    if (currentRaw !== undefined) {
+      let currentIsValid = false;
+      try {
+        const current = JSON.parse(currentRaw);
+        currentIsValid = Boolean(current && typeof current === 'object' && !Array.isArray(current));
+      } catch (_) {}
+      if (currentIsValid) {
+        await fs.writeFile(backupTemporary, currentRaw, 'utf8');
+        await fs.rename(backupTemporary, backupFile);
+      } else {
+        const quarantineFile = `${cacheFile}.corrupt.${Date.now()}.${process.pid}`;
+        await fs.rename(cacheFile, quarantineFile);
+        structuredLog('error', 'cache_corrupt_quarantined', { cacheFile, quarantineFile });
+      }
+    }
+    await fs.rename(temporary, cacheFile);
   } catch (err) {
-    // In serverless or read-only filesystems (e.g. Vercel), writes can fail.
-    // Don't let cache write failures break the API — fallback to in-memory behavior.
-    // Log the error for debugging but continue.
-    try { console.warn('historico cache write failed:', err && err.message ? err.message : err); } catch (e) {}
+    try { await fs.unlink(temporary); } catch (cleanupError) {
+      if (cleanupError && cleanupError.code !== 'ENOENT') structuredLog('warn', 'cache_temp_cleanup_failed', { code: cleanupError.code });
+    }
+    try { await fs.unlink(backupTemporary); } catch (cleanupError) {
+      if (cleanupError && cleanupError.code !== 'ENOENT') structuredLog('warn', 'cache_backup_temp_cleanup_failed', { code: cleanupError.code });
+    }
+    throw err;
+  }
+}
+
+function serializeCacheMutation(operation) {
+  const pending = cacheMutationQueue.then(operation, operation);
+  cacheMutationQueue = pending.catch(() => {});
+  return pending;
+}
+
+async function writeCache(cache) {
+  return serializeCacheMutation(() => writeCacheAtomic(cache));
+}
+
+async function persistCache(cache) {
+  try {
+    await writeCacheAtomic(cache);
+    return true;
+  } catch (err) {
+    structuredLog('warn', 'cache_write_failed', { code: err && err.code });
+    return false;
   }
 }
 
@@ -91,7 +212,17 @@ function groupByDate(normalizedValues) {
   return result;
 }
 
-async function fetchProviderForDay(dateIso, zone = 'peninsular') {
+async function providerGet(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await axios.get(url, { timeout: timeoutMs, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchProviderForDay(dateIso, zone = 'peninsular', timeoutMs = PROVIDER_CALL_TIMEOUT_MS) {
   // dateIso: YYYY-MM-DD
   const start = DateTime.fromISO(dateIso, { zone: TIME_ZONE }).startOf('day');
   const end = start.plus({ days: 1 });
@@ -100,14 +231,14 @@ async function fetchProviderForDay(dateIso, zone = 'peninsular') {
     endsAt: end.toISO({ suppressMilliseconds: true })
   };
   const url = buildProviderUrl(API_TEMPLATE(), day, zone);
-  const response = await axios.get(url, { timeout: 30_000 });
+  const response = await providerGet(url, timeoutMs);
   const items = response?.data?.included ? response.data.included.flatMap(g => g.attributes.values) : [];
   const normalized = normalizeProviderValues(items);
   return groupByDate(normalized.values)[0] || null; // should be single day
 }
 
 // Fetch provider data for an inclusive date range (YYYY-MM-DD start to end)
-async function fetchProviderForRange(startIso, endIso, zone = 'peninsular') {
+async function fetchProviderForRange(startIso, endIso, zone = 'peninsular', timeoutMs = PROVIDER_CALL_TIMEOUT_MS) {
   const start = DateTime.fromISO(startIso, { zone: TIME_ZONE }).startOf('day');
   const end = DateTime.fromISO(endIso, { zone: TIME_ZONE }).endOf('day');
   const day = {
@@ -115,7 +246,7 @@ async function fetchProviderForRange(startIso, endIso, zone = 'peninsular') {
     endsAt: end.toISO({ suppressMilliseconds: true })
   };
   const url = buildProviderUrl(API_TEMPLATE(), day, zone);
-  const response = await axios.get(url, { timeout: 60_000 });
+  const response = await providerGet(url, timeoutMs);
   const items = response?.data?.included ? response.data.included.flatMap(g => g.attributes.values) : [];
   const normalized = normalizeProviderValues(items);
   // groupByDate returns sorted daily aggregates
@@ -123,76 +254,77 @@ async function fetchProviderForRange(startIso, endIso, zone = 'peninsular') {
 }
 
 async function ensureDaysCached(dates, zone = 'peninsular') {
-  const cache = await readCache();
+  return serializeCacheMutation(() => ensureDaysCachedSerialized(dates, zone));
+}
+
+async function ensureDaysCachedSerialized(dates, zone = 'peninsular') {
+  const { cache, fromSeed } = await readCacheDetails();
+  const migrated = migrateLegacyRoot(cache);
   const zoneCache = getZoneCache(cache, zone);
-  const missing = dates.filter(d => !(d in zoneCache));
-  if (missing.length === 0) return cache;
+  const zoneKey = normalizeZone(zone).geo_limit;
+  if (!cache._retry || typeof cache._retry !== 'object' || Array.isArray(cache._retry)) cache._retry = {};
+  if (!cache._retry[zoneKey] || typeof cache._retry[zoneKey] !== 'object' || Array.isArray(cache._retry[zoneKey])) cache._retry[zoneKey] = {};
+  const retryState = cache._retry[zoneKey];
+  const now = Date.now();
+  const retryKey = date => `${zoneKey}:${date}`;
+  const missing = dates.filter(d => {
+    const retryAfter = Math.max(Number(retryState[d]?.retryAfter) || 0, retryCooldownMemory.get(retryKey(d)) || 0);
+    return !isUsableDay(zoneCache[d]) && retryAfter <= now;
+  });
+  if (missing.length === 0) {
+    if (migrated || fromSeed) await persistCache(cache);
+    return cache;
+  }
 
-  // In serverless environments (e.g. Vercel) synchronous fetching of many days
-  // can easily hit function timeouts because we may perform many external
-  // HTTP requests. Prefer a single range request to the provider when
-  // possible, falling back to marking days as missing if the provider call fails.
-  const runningServerless = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.SERVERLESS);
-  if (runningServerless) {
+  const deadline = now + PROVIDER_REQUEST_BUDGET_MS;
+  let providerCalls = 0;
+  const callTimeout = () => Math.min(PROVIDER_CALL_TIMEOUT_MS, Math.max(0, deadline - Date.now()));
+  const canCall = () => providerCalls < PROVIDER_MAX_CALLS && callTimeout() > 0;
+
+  if (missing.length > 1 && canCall()) {
     try {
-      // attempt to fetch as a single range from earliest missing to latest missing
       const sortedMissing = missing.slice().sort();
-      const rangeStart = sortedMissing[0];
-      const rangeEnd = sortedMissing[sortedMissing.length - 1];
-      const fetchedDays = await fetchProviderForRange(rangeStart, rangeEnd, zone);
-      // populate cache with any fetched days
+      providerCalls += 1;
+      const fetchedDays = await fetchProviderForRange(sortedMissing[0], sortedMissing[sortedMissing.length - 1], zone, callTimeout());
       for (const d of fetchedDays) {
-        if (d && d.fecha) zoneCache[d.fecha] = d;
-      }
-
-      // If range fetch did not return all days, attempt per-day fetch for remaining dates
-      const stillMissing = missing.filter(day => !(day in zoneCache));
-      if (stillMissing.length > 0) {
-        for (const day of stillMissing) {
-          try {
-            const fetched = await fetchProviderForDay(day, zone);
-            if (fetched) zoneCache[day] = fetched;
-            else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
-          } catch (e) {
-            // if per-day fetching fails, mark as missing but continue
-            zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true, error: String(e && e.message ? e.message : e) };
-          }
-          // be polite with provider when doing multiple calls
-          await new Promise(r => setTimeout(r, 250));
+        if (d && d.fecha && isUsableDay(d)) {
+          zoneCache[d.fecha] = d;
+          delete retryState[d.fecha];
+          retryCooldownMemory.delete(retryKey(d.fecha));
         }
       }
-
-      try { await writeCache(cache); } catch (e) {}
-      return cache;
     } catch (err) {
-      // If range fetch fails, don't block: attempt per-day fetch as a fallback
-      for (const day of missing) {
-        try {
-          const fetched = await fetchProviderForDay(day, zone);
-          if (fetched) zoneCache[day] = fetched;
-          else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
-        } catch (e) {
-          zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true, error: String(e && e.message ? e.message : e) };
-        }
-        await new Promise(r => setTimeout(r, 250));
-      }
-      try { await writeCache(cache); } catch (e) {}
-      return cache;
+      structuredLog('warn', 'provider_range_failed', { zone: zoneKey, code: err && err.code });
     }
   }
 
-  for (const day of missing) {
+  const stillMissing = missing.filter(day => !isUsableDay(zoneCache[day]));
+  for (const day of stillMissing) {
+    if (!canCall()) break;
     try {
-      const fetched = await fetchProviderForDay(day, zone);
-      if (fetched) zoneCache[day] = fetched;
-      else zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, missing: true };
+      providerCalls += 1;
+      const fetched = await fetchProviderForDay(day, zone, callTimeout());
+      if (isUsableDay(fetched)) {
+        zoneCache[day] = fetched;
+        delete retryState[day];
+        retryCooldownMemory.delete(retryKey(day));
+      }
     } catch (err) {
-      zoneCache[day] = { fecha: day, media: null, minimo: null, maximo: null, error: String(err.message || err) };
+      structuredLog('warn', 'provider_day_failed', { zone: zoneKey, date: day, code: err && err.code });
     }
-    // be polite with provider
-    await new Promise(r => setTimeout(r, 300));
   }
-  await writeCache(cache);
+  const retryAfter = Date.now() + PROVIDER_COOLDOWN_MS;
+  for (const day of missing) {
+    if (!isUsableDay(zoneCache[day])) {
+      retryState[day] = { retryAfter };
+    }
+  }
+  const persisted = await persistCache(cache);
+  if (!persisted) {
+    for (const day of missing) {
+      if (!isUsableDay(zoneCache[day])) retryCooldownMemory.set(retryKey(day), retryAfter);
+    }
+  }
   return cache;
 }
 
@@ -243,7 +375,13 @@ function aggregateWeeksFromDaily(dailyArray) {
 }
 
 async function getHistorico(kind, zone = 'peninsular') {
+  return (await getHistoricoResult(kind, zone)).values;
+}
+
+async function getHistoricoResult(kind, zone = 'peninsular') {
   const dates = datesForRange(kind);
+  if (kind === 'anio') return getAnnualHistoricoResult(dates, zone);
+
   const cache = await ensureDaysCached(dates, zone);
   const zoneCache = getZoneCache(cache, zone);
   const daily = dates.map(d => {
@@ -257,12 +395,44 @@ async function getHistorico(kind, zone = 'peninsular') {
     };
   });
 
-  if (kind === 'anio') {
-    // aggregate daily into weekly buckets for a clearer yearly chart
-    return aggregateWeeksFromDaily(daily);
-  }
-
-  return daily;
+  return { values: daily, partial: false };
 }
 
-module.exports = { getHistorico, ensureDaysCached, CACHE_FILE, aggregateDay, groupByDate, datesForRange };
+async function getAnnualHistoricoResult(dates, zone) {
+  // Atomic rename guarantees this read sees either the previous or next complete snapshot.
+  // Keep annual reads outside the mutation queue so provider backfills cannot block them.
+  const { cache } = await readCacheDetails();
+  migrateLegacyRoot(cache);
+  const zoneCache = getZoneCache(cache, zone);
+  const available = dates.flatMap(date => {
+    const day = zoneCache[date];
+    return isUsableDay(day) ? [{ fecha: date, media: day.media, minimo: day.minimo, maximo: day.maximo }] : [];
+  });
+
+  const missingDays = dates.length - available.length;
+  const values = aggregateWeeksFromDaily(available);
+  return {
+    values,
+    partial: missingDays > 0,
+    message: missingDays > 0 ? 'Historical data is partial; only cached numeric days are included.' : undefined,
+    metadata: { requestedDays: dates.length, availableDays: available.length, missingDays, bucketCount: values.length }
+  };
+}
+
+module.exports = {
+  getHistorico,
+  getHistoricoResult,
+  ensureDaysCached,
+  readCache,
+  readCacheDetails,
+  writeCache,
+  writeCacheAtomic,
+  migrateLegacyRoot,
+  isUsableDay,
+  CACHE_FILE,
+  SEED_FILE,
+  aggregateDay,
+  aggregateWeeksFromDaily,
+  groupByDate,
+  datesForRange
+};

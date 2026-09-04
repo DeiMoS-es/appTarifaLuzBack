@@ -1,6 +1,6 @@
 const express = require('express');
 const { normalizeZone } = require('./precios');
-const { getHistorico, ensureDaysCached } = require('../../services/historico');
+const { getHistorico, getHistoricoResult, ensureDaysCached } = require('../../services/historico');
 
 const axios = require('axios');
 const { buildProviderUrl } = require('./precios');
@@ -39,38 +39,20 @@ router.get('/mes', async (req, res) => {
   }
 });
 
-// Helper to execute getHistorico with an internal timeout to avoid Vercel 504s
-async function getHistoricoWithTimeout(kind, zone, ms = 7000) {
-  const timeout = new Promise((resolve) => {
-    setTimeout(() => resolve({ __timedOut: true }), ms);
-  });
-  try {
-    const result = await Promise.race([getHistorico(kind, zone), timeout]);
-    if (result && result.__timedOut) return { __timedOut: true };
-    return { values: result };
-  } catch (err) {
-    // propagate error
-    throw err;
-  }
-}
-
 // GET /api/historico/anio
 router.get('/anio', async (req, res) => {
+  const startedAt = Date.now();
   try {
     const zone = resolveZone(req);
-    const resp = await getHistoricoWithTimeout('anio', zone.geo_limit, 7000);
-    if (resp.__timedOut) {
-      // return consistent shape with nulls for values if we timed out
-      const dates = require('../../services/historico').datesForRange('anio');
-      const values = dates.map(d => ({ fecha: d, media: null, minimo: null, maximo: null }));
-      return res.status(200).json({ range: 'anio', zone: zone.geo_limit, values, partial: true, message: 'Datos parciales: la recopilación se está procesando y se devolverán cuando esté disponible.' });
-    }
-    return res.status(200).json({ range: 'anio', zone: zone.geo_limit, values: resp.values });
+    const result = await getHistoricoResult('anio', zone.geo_limit);
+    console.info(JSON.stringify({ component: 'historico', event: 'annual_response', zone: zone.geo_limit, partial: result.partial, latencyMs: Date.now() - startedAt, ...result.metadata }));
+    return res.status(200).json({ range: 'anio', zone: zone.geo_limit, ...result });
   } catch (err) {
     if (err && typeof err.message === 'string' && err.message.startsWith('Unsupported zone:')) {
       return res.status(400).json({ error: 'invalid_zone', message: 'zone must be one of peninsular, canarias, baleares, ceuta or melilla' });
     }
-    return res.status(500).json({ error: 'historico_error', message: String(err.message || err) });
+    console.error(JSON.stringify({ component: 'historico', event: 'annual_failure', latencyMs: Date.now() - startedAt, code: err && err.code }));
+    return res.status(500).json({ error: 'historico_error', message: 'Annual historical data is temporarily unavailable.' });
   }
 });
 
